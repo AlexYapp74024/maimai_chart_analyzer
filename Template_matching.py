@@ -12,8 +12,12 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from deep_sort_realtime.deep_sort.track import Track
 from IPython.display import HTML
 from InvariantTM import BBox, Template_Matcher
-import itertools
 import shutil
+
+import pims
+from pims import Frame
+import trackpy as tp
+from slicerator import Slicerator
 
 import random
 import colorsys
@@ -38,11 +42,13 @@ def load_image(path:Path):
 # %%
 start = 6700
 start = 4000
-length = 80
-work_paths = list(Path("data/images").glob("*"))[start:start+length]
-image_list = [load_image(p) for p in work_paths]
+length = 40
 
+raw_image_list = pims.open('data/videos/【maimaiでらっくす外部出力】sølips MASTER AP.mp4')[start:start+length]
+
+# %%
 def animate_images(images: list[np.ndarray], cmap = None):
+    images = list(images)
     fig = plt.figure()
     plt.axis('off')
     im = plt.imshow(images[0], cmap)
@@ -65,7 +71,7 @@ def draw_bboxes(image_list: list[np.ndarray], bboxes : list[list[BBox]], scale =
             tlbr = (b.tlbr*scale).astype(np.int32)
             img = cv2.rectangle(img,tlbr[:2], tlbr[2:],color, thickness)
             
-            label = f"{b.track_id}"
+            label = f"{b.track_id}:{b.conf:.2f}"
             (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
             x,y = tlbr[:2] - np.array([0,h])
             img = cv2.rectangle(img, (x, y - h), (x + w, y), color, -1)
@@ -73,58 +79,109 @@ def draw_bboxes(image_list: list[np.ndarray], bboxes : list[list[BBox]], scale =
         images.append(img)
     return images
 
-# animate_images(image_list)
 # %%
-method=cv2.TM_CCORR_NORMED
-matched_thresh=0.85
+@pims.pipeline
+def tresh_mask_rgb(image : Frame, tresh, max = 255, method = cv2.THRESH_BINARY):
+    mask = cv2.threshold(image,tresh,max,method)[1]
+    return Frame(mask)
+
+@pims.pipeline(ancestor_count=2)
+def frame_difference(image0 : Frame, image1 : Frame) -> list[Frame]:
+    return cv2.threshold(image1 - image0,1,255,cv2.THRESH_BINARY)[1]
+
+@pims.pipeline
+def morphed(image) -> list[Frame]:
+    kernal = np.ones((5,5),np.uint8)
+    image = cv2.morphologyEx(image,cv2.MORPH_DILATE ,kernal,iterations=1)
+    image = cv2.morphologyEx(image,cv2.MORPH_OPEN   ,kernal,iterations=3)
+    image = cv2.morphologyEx(image,cv2.MORPH_DILATE ,kernal,iterations=5)
+    image = cv2.morphologyEx(image,cv2.MORPH_CLOSE  ,kernal,iterations=5)
+    image = cv2.morphologyEx(image,cv2.MORPH_DILATE ,kernal,iterations=5)
+    return Frame(image)
+
+masked = tresh_mask_rgb(raw_image_list, 242)
+morpheds = morphed(frame_difference(masked[:-1], masked[1:]))
+# %
+# animate_images(tqdm(masked))
+# animate_images(raw_image_list[:1])
+# %%
+hsvs = cv2.cvtColor(morpheds[0],cv2.COLOR_RGB2HSV)
+hsv = hsvs.copy()
+
+buckets = [-1,0]
+MAX_GAP = 10
+for n in np.unique(hsv[...,0]):
+    # if n < 2: continue
+    if n - buckets[-1] > MAX_GAP: buckets.append(n)
+    else: buckets[-1] = n
+np.unique(hsv[...,0])
+
+masks = []
+for lower, upper in zip(buckets[:-1],buckets[1:]):
+    mask = (hsv[...,0] > lower) * (hsv[...,0] <= upper) * (hsv[...,2] > 0)
+    mask = np.uint8(mask)
+    mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((15,15),np.uint8),iterations=5)
+    dist = cv2.distanceTransform(mask,cv2.DIST_L2,3)
+    _ , sure_fg = cv2.threshold(dist,0.2 * dist.max(),255,0)
+    masks.append(dist)
+
+Frame(cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR))
+# Frame(morpheds[0])
+Frame(masks[0])
+# %%
 TEMPLATE_DIR = Path("templates")
+method=cv2.TM_CCORR_NORMED
 
-tap_templates  = [load_image_rgba(i) for i in (TEMPLATE_DIR / "Tap").glob("*")]
-template_matchers = [Template_Matcher(t,method,matched_thresh,
-                                      rot_range=[22,90+22], rot_interval=45, 
-                                      scale_range=[70,111], scale_interval=5,) for t in tap_templates]
-
-tap_spot_templates  = [load_image_rgba(i) for i in (TEMPLATE_DIR / "Tap Location").glob("*")]
-tap_spot_matchers = [Template_Matcher(t,method,0.95,
+tap_spot_templates = [load_image_rgba(i) for i in (TEMPLATE_DIR / "Tap Location").glob("*")]
+tap_spot_matchers  = [Template_Matcher(0,t,method,0.95,
                                       rot_range=[0,360], rot_interval=45, 
                                       scale_range=[95,105], scale_interval=5,) for t in tap_spot_templates]
 
-crit_templates = [load_image_rgba(i) for i in (TEMPLATE_DIR / "Crit Perf").glob("*")]
-crit_matchers = [Template_Matcher(t,method,matched_thresh,
-                                  rot_range=[22,360+22], rot_interval=45, 
-                                  scale_range=[80,111], scale_interval=5,) for t in crit_templates]
+match_treshold = 0.83
+tap_matchers = [Template_Matcher(1,load_image_rgba(i),method,match_treshold,
+                rot_range=[0,90-1], rot_interval=90, 
+                scale_range=[70,111], scale_interval=5,) for i in (TEMPLATE_DIR / "Tap").glob("*")] +[
+                Template_Matcher(1,load_image_rgba(i),method,match_treshold,
+                rot_range=[0,360-1], rot_interval=90, 
+                scale_range=[70,111], scale_interval=5,) for i in (TEMPLATE_DIR / "Tap_glow").glob("*")] 
+
+# tap_matchers = [Template_Matcher.combine(tap_matchers)]
+# tap_matchers
+# %%
+@pims.pipeline
+def _match_image(image:np.ndarray, i:int, templates:list[Template_Matcher]) -> list[BBox]:
+    points_list = sum((t.match(cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)) for t in templates),[])
+    for p in range(len(points_list)): points_list[p].frame_id = i
+    rects  = [p.tlbr for p in points_list]
+    scores = [p.conf for p in points_list]
+    return [points_list[i] for i in cv2.dnn.NMSBoxes(rects, scores, 0.7, 0.8)]
 
 def match_templates(images:list[np.ndarray], templates:list[Template_Matcher]) -> list[list[BBox]]:
-    def _match_image(i:int, image:np.ndarray, templates:list[Template_Matcher]) -> list[BBox]:
-        points_list = sum((t.match(image) for t in templates),[])
-        for p in range(len(points_list)): points_list[p].frame_id = i
-        rects  = [p.tlbr for p in points_list]
-        scores = [p.conf for p in points_list]
-        return [points_list[i] for i in cv2.dnn.NMSBoxes(rects, scores, 0.7, 0.8)]
-    return Parallel(-1)(delayed(_match_image)(i,cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), templates) for i,image in enumerate(images))
+    return Parallel(-1)(delayed(_match_image)(image, i, templates) for i,image in enumerate(images))
     return list(_match_image(i,cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), templates) for i,image in enumerate(images))
 
+image_list = tresh_mask_rgb(raw_image_list, 128, method=cv2.THRESH_TOZERO)
+image_list = raw_image_list
+# %%
 t = perf_counter()
-tap_spot_bboxes : list[BBox] = sum(match_templates(tqdm(image_list), tap_spot_matchers),[])
+tap_spot_bboxes : list[BBox] = sum(match_templates(tqdm(image_list[::2]), tap_spot_matchers),[])
 print(f"{perf_counter() - t:.3f}")
 
-t = perf_counter()
-bboxes_list = match_templates(tqdm(image_list), template_matchers)
-print(f"{perf_counter() - t:.3f}")
 # %%
-rects  = [b.tlbr for b in tap_spot_bboxes]
-scores = [b.conf for b in tap_spot_bboxes]
-tap_spots : list[BBox] = [tap_spot_bboxes[i] for i in cv2.dnn.NMSBoxes(rects, scores, 0.7, 0.8)]
+# bboxes_list = _match_image(image_list, Slicerator(range(len(image_list))) , template_matchers)
+bboxes_list = match_templates(image_list, tap_matchers)
+animate_images(draw_bboxes(image_list,bboxes_list,scale=0.5,thickness=1,font_scale=0.4))
 # %%
 MAX_AGE = 15
 
-def deepsort(image_list:list[np.ndarray], point_list: list[list[BBox]], reverse = False):
+def deepsort(image_list:list[np.ndarray], point_list: list[list[BBox]], reverse = False, assign_id = True):
     def track_2_bbox(track:Track) -> BBox:
         conf = track.det_conf if track.det_conf else 0.3
         # other:BBox = track.others
         return BBox(track.to_ltrb(),
                     conf=conf,
                     angle=0,
+                    scale=1.0,
                     track_id=int(track.track_id))
 
     tracker = DeepSort(max_age=MAX_AGE)
@@ -132,40 +189,62 @@ def deepsort(image_list:list[np.ndarray], point_list: list[list[BBox]], reverse 
     iters = list(zip(image_list, point_list))
     if reverse: iters = reversed(iters)
     for image, points in iters:
-        tracks: list[Track] = tracker.update_tracks([[p.tlwh(), p.conf] for p in points],frame = image,others=points)
+        tracks: list[Track] = tracker.update_tracks([[p.tlwh(), p.conf] 
+                                                     for p in points],frame = image,others=points)
         bboxes.append([track_2_bbox(track) for track in tracks])
     return bboxes
 
-def remove_dropped(bboxes:list[list[BBox]]):
-    past_tids = set(b.track_id for b in bboxes[MAX_AGE-1])
-    for t, bboxs in enumerate(bboxes[MAX_AGE:],MAX_AGE): 
+def remove_dropped(bboxes:list[list[BBox]], margin = 0):
+    past_tids = set(b.track_id for b in bboxes[MAX_AGE - margin-1])
+    for t, bboxs in enumerate(bboxes[MAX_AGE - margin:],MAX_AGE - margin): 
         tids = set(b.track_id for b in bboxs)
         dropped = past_tids - tids
-        for i in range(t-MAX_AGE,t):
+        for i in range(t-MAX_AGE-margin,t):
             bboxes[i] = [b for b in bboxes[i] if b.track_id not in dropped]
         past_tids = tids
     return bboxes
 
-#%%
 bboxes = bboxes_list
 bboxes = deepsort(image_list, bboxes, reverse = True)
-bboxes = remove_dropped(bboxes)
+bboxes = remove_dropped(bboxes,3)
 bboxes = deepsort(image_list, bboxes)
-bboxes : list[list[BBox]] = list(reversed(remove_dropped(bboxes)))
+bboxes = remove_dropped(bboxes,3)
+bboxes : list[list[BBox]] = list(reversed(bboxes))
 for frame, boxes in enumerate(bboxes):
     for i, b in enumerate(boxes):
         bboxes[frame][i].frame_id = frame
 
+animate_images(draw_bboxes(image_list,bboxes,scale=0.5,thickness=1,font_scale=0.4))
+# %%
 box_by_track_ids : dict[int, list[BBox]]= {}
 filtered_conf = [[b for b in boxs if b.conf >= 0.6] for boxs in bboxes]
 for box in sum(filtered_conf,[]):
     box_by_track_ids[box.track_id] = box_by_track_ids.get(box.track_id, []) + [box]
 
-min_max_frames = {t:(min(boxes,key=lambda b:b.frame_id).frame_id, max(boxes,key=lambda b:b.frame_id).frame_id) for t,boxes in box_by_track_ids.items()}
-bboxes = [[b for b in boxs if b.conf >= 0.6 or (b.frame_id >= min_max_frames[b.track_id][0] and b.frame_id <= min_max_frames[b.track_id][1])] 
+minmax_buffer = 3
+min_max_frames = {t:(min(boxes,key=lambda b:b.frame_id).frame_id - minmax_buffer, 
+                     max(boxes,key=lambda b:b.frame_id).frame_id + minmax_buffer) 
+                  for t,boxes in box_by_track_ids.items()}
+bboxes = [[b for b in boxs if (b.track_id in min_max_frames.keys() and
+                               b.frame_id >= min_max_frames[b.track_id][0] and 
+                               b.frame_id <= min_max_frames[b.track_id][1])] 
           for boxs in bboxes]
-# animate_images(draw_bboxes(image_list,bboxes,scale=0.5,thickness=2,font_scale=0.4))
-#%%
+
+# animate_images(draw_bboxes(image_list,bboxes,scale=0.5,thickness=1,font_scale=0.4))
+# %%
+@pims.pipeline(ancestor_count = 2)
+def fill_rect(image : Frame, bboxes: list[BBox], color):
+    for b in bboxes:
+        tlbr = np.int32(b.tlbr)
+        image = cv2.rectangle(image,tlbr[:2], tlbr[2:],color, -10)
+    return Frame(image)
+         
+animate_images(fill_rect(image_list,Slicerator(bboxes),(0,0,0)))
+# %%
+rects  = [b.tlbr for b in tap_spot_bboxes]
+scores = [b.conf for b in tap_spot_bboxes]
+tap_spots : list[BBox] = [tap_spot_bboxes[i] for i in cv2.dnn.NMSBoxes(rects, scores, 0.7, 0.8)]
+
 def is_outlier(data, m=0.5): return abs(data - np.median(data)) > m * np.std(data)
 
 nearest_to_taps : list[BBox] = [max(box_, key = lambda b: b.frame_id) for box_ in box_by_track_ids.values()]
@@ -173,6 +252,7 @@ tap_sensors = [b.center() for b in tap_spot_bboxes]
 distances = np.array([min(np.sum(np.square(fb.center() - ts)) for ts in tap_sensors) for fb in nearest_to_taps])
 outliers_idx : list[int] = [box.track_id for box, reject in zip(nearest_to_taps, is_outlier(distances)) if reject]
 
+filtered_conf = [[b for b in bs if b.conf > 0.6] for bs in bboxes]
 box_by_track_ids : dict[int, list[BBox]]= {}
 for box in sum(filtered_conf,[]):
     if box.track_id in outliers_idx : continue
@@ -182,33 +262,34 @@ bboxes : list[list[BBox]] = [[]] * len(bboxes)
 for b in sum(list(box_by_track_ids.values()),[]):
     bboxes[b.frame_id] = bboxes[b.frame_id] + [b]
 
-box_by_frame_ids : dict[int, list[BBox]]= {}
-for box in sum(bboxes,[]):
-    box_by_frame_ids[box.frame_id] = box_by_frame_ids.get(box.frame_id, []) + [box]
-#%%
-frame_tracks = sorted([(k,set(v.track_id for v in vs)) for k,vs in box_by_frame_ids.items()], key = lambda kv: -len(kv[1]))
-
-still_untracked = set(b.track_id for b in sum(bboxes,[]))
-batch_frames = []
-LOOK_AHEAD = 20
-while len(still_untracked) > 0:
-    look_aheads = []
-    for frame, boxes in frame_tracks[0:LOOK_AHEAD]:
-        if len(boxes) != len(frame_tracks[0][1]): break
-        look_aheads.append((frame, boxes))
-    
-    frame, boxes = look_aheads[len(look_aheads)//2]
-    batch_frames.append(frame)
-    [still_untracked.remove(b) for b in boxes if b in still_untracked]
-    frame_tracks = sorted([(k,set(v.track_id for v in vs if v.track_id in still_untracked)) for k,vs in box_by_frame_ids.items()], key = lambda kv: -len(kv[1]))
-
-batch_boxes = {i: box_by_frame_ids[i] for i in batch_frames}
-output_boxes : list[list[BBox]] = [[]] * len(bboxes_list)
-for b in sum(batch_boxes.values(),[]):
-    output_boxes[b.frame_id] = output_boxes[b.frame_id] + [b]
-batch_frames
+animate_images(draw_bboxes(image_list,bboxes,scale=0.5,thickness=2,font_scale=0.4))
 # %%
-animate_images(draw_bboxes(image_list,output_boxes,scale=0.5, font_scale=0.4))
+# box_by_frame_ids : dict[int, list[BBox]]= {}
+# for box in sum(bboxes,[]):
+#     box_by_frame_ids[box.frame_id] = box_by_frame_ids.get(box.frame_id, []) + [box]
+
+# frame_tracks = sorted([(k,set(v.track_id for v in vs)) for k,vs in box_by_frame_ids.items()], key = lambda kv: -len(kv[1]))
+
+# still_untracked = set(b.track_id for b in sum(bboxes,[]))
+# batch_frames = []
+# LOOK_AHEAD = 20
+# while len(still_untracked) > 0:
+#     look_aheads = []
+#     for frame, boxes in frame_tracks[0:LOOK_AHEAD]:
+#         if len(boxes) != len(frame_tracks[0][1]): break
+#         look_aheads.append((frame, boxes))
+    
+#     frame, boxes = look_aheads[len(look_aheads)//2]
+#     batch_frames.append(frame)
+#     [still_untracked.remove(b) for b in boxes if b in still_untracked]
+#     frame_tracks = sorted([(k,set(v.track_id for v in vs if v.track_id in still_untracked)) for k,vs in box_by_frame_ids.items()], key = lambda kv: -len(kv[1]))
+
+# batch_boxes = {i: box_by_frame_ids[i] for i in batch_frames}
+# output_boxes : list[list[BBox]] = [[]] * len(bboxes_list)
+# for b in sum(batch_boxes.values(),[]):
+#     output_boxes[b.frame_id] = output_boxes[b.frame_id] + [b]
+# batch_frames
+# animate_images(draw_bboxes(image_list,output_boxes,scale=0.5, font_scale=0.4))
 # %%
 import torch
 if torch.cuda.is_available(): device = torch.device("cuda")
@@ -308,7 +389,7 @@ def merge_masks_segments(frame:int, boxs:list[BBox]) -> list[BBox]:
 # output_boxes : list[list[BBox]] = [[]] * len(bboxes)
 # for b in SAM_boxes:
 #     output_boxes[b.frame_id] = output_boxes[b.frame_id] + [b]
+# animate_images(draw_bboxes(image_list,output_boxes,scale=0.5,thickness=2,font_scale=0.4))
 # %%
-animate_images(draw_bboxes(image_list,output_boxes,scale=0.5,thickness=2,font_scale=0.4))
 # output_boxes
 # %%

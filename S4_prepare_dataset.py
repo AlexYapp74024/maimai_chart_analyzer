@@ -21,7 +21,6 @@ test  = labels[len(valid) + len(train):]
 
 assert train + valid + test == labels
 
-
 #%%
 def copy_label_and_image(label:str, dir:Path):
     label_path = Path(RAW_DATA_DIR / "labels" / label)
@@ -59,6 +58,6 @@ with open(DATASET_DIR / "data.yaml", "w") as file:
 print(f"cd {Path('.').absolute()}")
 
 # %%
-print(f"yolo train model=yolov9c.pt data={(DATASET_DIR/'data.yaml').absolute()} batch=12 epochs=100 imgsz=720")
+print(f"yolo train model=yolov9c.pt data={(DATASET_DIR/'data.yaml').absolute()} batch=12 epochs=70 imgsz=640")
 
 # %%

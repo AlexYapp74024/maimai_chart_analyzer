@@ -16,7 +16,7 @@ vids = list(VID_DIR.glob("*"))
 Path(IMG_DIR := "data/images").mkdir(exist_ok=True, parents=True)
 Path(LOG_DIR := "logs").mkdir(exist_ok=True, parents=True)
 FRAME = 1
-SCALE = 2
+# SCALE = 2
 
 OUT_FORMAT = ".webp"
 
@@ -62,7 +62,7 @@ def exec(pb:tqdm, s:SplitJob):
     s.save_frame()
     pb.update(1)
 
-hashes = list(hashlib.md5(str(v).encode()).hexdigest() for v in vids)
+hashes = list(hashlib.md5(str(v.name).encode()).hexdigest() for v in vids)
 assert len(set(hashes)) == len(vids)
 
 splitjobs = sum([split_video(*vi) for vi in zip(hashes, vids)],[])
