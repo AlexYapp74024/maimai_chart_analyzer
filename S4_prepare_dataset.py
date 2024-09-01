@@ -58,6 +58,12 @@ with open(DATASET_DIR / "data.yaml", "w") as file:
 print(f"cd {Path('.').absolute()}")
 
 # %%
-print(f"yolo train model=yolov9c.pt data={(DATASET_DIR/'data.yaml').absolute()} batch=12 epochs=70 imgsz=640")
+from pathlib import Path
+MODEL_FILE = list(Path("runs").glob("**/last.pt"))[-1]
+DATASET_DIR = Path("dataset")
 
+params = f"batch=12 epochs=70 imgsz=640 dropout=0.3 mixup=0.5 copy_paste=0.5"
+print(f"yolo train model=yolov9c.pt data={(DATASET_DIR/'data.yaml').absolute()} {params}")
+print(f"yolo train model={MODEL_FILE} data={(DATASET_DIR/'data.yaml').absolute()} {params} resume=True")
+# %%
 # %%

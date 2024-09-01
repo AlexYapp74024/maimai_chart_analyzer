@@ -1,15 +1,9 @@
 #%% Imports
-import os
+from statistics import mean
 from itertools import chain
 from pathlib import Path
 import random
 import shutil
-import scipy.interpolate
-import scipy.interpolate.interpnd
-import scipy.interpolate.interpolate
-import scipy.stats
-import scipy.stats._stats_mstats_common
-import torch
 from slicerator import Slicerator
 from tqdm import tqdm
 import cv2
@@ -21,8 +15,7 @@ from matplotlib import animation
 from IPython.display import HTML
 
 from ultralytics import YOLO
-from ultralytics.engine.results import Boxes, Results
-import supervision as sv
+from ultralytics.engine.results import Results
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from deep_sort_realtime.deep_sort.track import Track
 
@@ -58,16 +51,17 @@ def animate_images(images: list[np.ndarray], cmap = None):
     return HTML(ani.to_jshtml())
 
 @pims.pipeline(ancestor_count = 3)
-def label_results(image:Frame,res:Results, frame = 0, thickness=2, font_scale=0.8, lable_frame = True, names = None):
-    if names is None: names = res.names
+def label_results(image:Frame,res:Results, frame = 0, thickness=2, font_scale=0.8, lable_frame = True):
+    names = res.names
     img = image
     for r in res.boxes.cpu().numpy():
-        if not r.is_track: continue
         p1,p2 = np.int64(np.reshape(r.xyxy,(2,2)))
-        color = colors(r.id)
+        color = colors(r.cls)
         img = cv2.rectangle(img,p1,p2,color,thickness)
         
-        label = f"{r.id[0]}. {names[r.cls[0]]}:{r.conf[0]:.2f}"
+        label = f"{names[r.cls[0]]}:{r.conf[0]:.2f}"
+        if r.is_track : label = f"{r.id[0]}." + label
+
         (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
         x,y = p1 - np.array([0,h*2])
         img = cv2.rectangle(img, (x, y - h), (x + w, y), color, -1)
@@ -78,8 +72,8 @@ def label_results(image:Frame,res:Results, frame = 0, thickness=2, font_scale=0.
     return Frame(img)
 
 @pims.pipeline(ancestor_count = 3)
-def label_tracks(images:Frame,tracks:list[Track], frame = 0, thickness=2, font_scale=0.8, names = None, orig=True):
-    if names is None: names = model.names
+def label_tracks(images:Frame,tracks:list[Track], frame = 0, thickness=2, font_scale=0.8, orig=True):
+    names = yolo.names
     img = images.copy()
     for t in tracks:
         wh = (t.to_tlwh(orig=orig) / 2)[2:4]
@@ -111,30 +105,39 @@ def cache_opreation(call, path:Path):
     
     with open(path, "rb") as file: return pickle.load(file)
 
+def srange(obj):
+    if isinstance(obj, int): return Slicerator(range(obj))
+    return Slicerator(range(len(obj)))
+
+def chunks(xs, n, window = 0):
+    n = max(1, n)
+    return [xs[i:i+n] for i in range(0, len(xs)-window, n-window)]
+
+def schunks(xs, n, window = 0):
+    n = max(1, n)
+    return Slicerator([xs[i:i+n] for i in range(0, len(xs)-window, n-window)])
+
 def pim_export(pipeline, file_name, rate = 60):
     pims.export(pipeline,file_name,rate=rate)
     MediaPlayer('notif.mp3').play()
 #%% YOLO Detection
 model_file = list(MODELS_DIR.glob("**/best.pt"))[-1]
-model = YOLO(model_file, verbose=False)
-
-video_path = (DATA_DIR/"videos/out.mp4")
-video_path = list((DATA_DIR/"videos").glob("*"))[-1]
-frames = pims.open(video_path.__str__())
+yolo = YOLO(model_file, verbose=False)
 
 @pims.pipeline
 def predict_chunks(frame) -> list[list[Results]]:
-    if len(frame) > 1: return model.track(list(frame), verbose=False, persist=True)
-    return model.track(frame, verbose=False, persist=True)
+    if len(frame) > 1: return yolo.predict(list(frame), verbose=False)
+    return yolo.track(list(frame), verbose=False)
 
-def srange(obj):
-    if isinstance(obj, int): return Slicerator(range(obj))
-    return Slicerator(range(len(obj)))
+@pims.pipeline
+def track_chunks(frame) -> list[list[Results]]:
+    if len(frame) > 1: return yolo.track(list(frame), verbose=False, persist=True)
+    return yolo.track(list(frame), verbose=False, persist=True)
 
-from typing import MutableSequence
-def schunks(xs, n, window = 0):
-    n = max(1, n)
-    return Slicerator([xs[i:i+n] for i in range(0, len(xs)-window, n-window)])
+# video_path = list((DATA_DIR/"videos").glob("*"))[-1]
+video_path = (DATA_DIR/"videos/【maimaiでらっくす外部出力】QZKago Requiem　MASTER　AP.mp4")
+frames_raw = pims.open(video_path.__str__())
+frames = tresh_mask_rgb(frames_raw,128,method = cv2.THRESH_TOZERO)
 
 import hashlib
 (TEMP_RESULT_DIR := Path("temp") / hashlib.md5(str(video_path.name).encode()).hexdigest()).mkdir(exist_ok=True,parents=True)
@@ -144,12 +147,12 @@ def strip(r:Results):
     return r
 
 def do(): return [strip(r) for rs in tqdm(predict_chunks(schunks(frames[:-1], 32))) for r in rs]
-results = cache_opreation(do, TEMP_RESULT_DIR / "res_.pyz")
+yolo_results :list[Results] = cache_opreation(do, TEMP_RESULT_DIR / "res_p.pyz")
 
-labeled_results = label_results(frames[:-1],Slicerator(results),srange(len(results)))
-pim_export(labeled_results,TEMP_RESULT_DIR/ "raw_res.mp4")
-# animate_images(labeled_results[S:L])
+labeled_results = label_results(frames[:-1],Slicerator(yolo_results),srange(len(yolo_results)))
+# pim_export(labeled_results,TEMP_RESULT_DIR/ "raw_res_p.mp4",rate=30)
 
+# animate_images(labeled_results[S:S+20])
 #%% Tap Spots
 from InvariantTM import BBox, Template_Matcher
 from joblib import delayed, Parallel
@@ -182,20 +185,41 @@ def do():
 
 tap_spots = cache_opreation(do, TEMP_RESULT_DIR / "tap_spots.pyz")
 
-from statistics import mean, mode
-#%% Deep Sort
-names = {4 : "Hold Touch", 3 : "Touch", 0 : "Tap", 1 : "Hold", 2 : "Star"}
-remap_vals = {km : next(k for k,v in names.items() if v in vm) for km,vm in model.names.items()}
+# %% Create Segmasks
+from ultralytics import FastSAM
+sam = FastSAM()
 
-MAX_AGE = 10
-MIN_AGE = 5
+@pims.pipeline(ancestor_count=2)
+def mask_chunks(frame, xyxys) -> np.ndarray|None:
+    h,w,_ = frame.shape
+    if len(xyxys) == 0: out = np.zeros((h,w), np.bool_)
+    else: out = cv2.resize(sum(sam.predict(frame,bboxes=xyxys,verbose=False)[0].cpu().masks.data).numpy(), (w,h)) > 0
+    return np.uint8(out)
+
+@pims.pipeline(ancestor_count=2)
+def apply_mask(frame, mask:np.ndarray):
+    frame[~np.bool_(mask)] = 0
+    return Frame(frame)
+
+if not (mask_vid := TEMP_RESULT_DIR/ "mask.mp4").exists():
+    boxes = [res.boxes.xyxy.numpy() for res in yolo_results]
+    masks = mask_chunks(frames[:-1], Slicerator(boxes))
+    pim_export(masks,TEMP_RESULT_DIR/ "mask.mp4",rate=30)
+masks = pims.open(str(mask_vid))
+masked = apply_mask(frames[:-1], masks)
+
+# %% Deep Sort
+names = {4 : "Hold Touch", 3 : "Touch", 0 : "Tap", 1 : "Hold", 2 : "Star"}
+remap_vals = {km : next(k for k,v in names.items() if v in vm) for km,vm in yolo.names.items()}
+
+MAX_AGE = 5
 from copy import deepcopy
 def deepsort(images: list[Frame], res: list[Results]) -> list[Track]:
-    tracker = DeepSort(max_age=MAX_AGE)
+    tracker = DeepSort(max_age=MAX_AGE,max_iou_distance=1.4,gating_only_position=True, max_cosine_distance=0.5)
     age_dict = {}
 
     def _next(frame:int, image:Frame , res: Results) -> list[Track]:
-        detections = [[np.int64(p.xywh[0]), p.conf, p.cls] for p in res.boxes.cpu().numpy()]
+        detections = [[np.int64(p.xywh[0]), 0.9, p.cls] for p in res.boxes.cpu().numpy()]
         tracks : list[Track] = tracker.update_tracks(detections,frame = image, others=res)
         for t in tracks:
             if t.det_conf is None: t.det_conf = 0.3
@@ -207,18 +231,19 @@ def deepsort(images: list[Frame], res: list[Results]) -> list[Track]:
         return deepcopy(tracks)
     
     tracks = [_next(f, i, r) for f, (i, r) in enumerate(zip(images, tqdm(res)))]
-    too_short = [k for k,v in age_dict.items() if v < MIN_AGE]
-    tracks = [[t for t in ts if t.track_id not in too_short] for ts in tracks]
+    # too_short = [k for k,v in age_dict.items() if v < MIN_AGE]
+    # tracks = [[t for t in ts if t.track_id not in too_short] for ts in tracks]
     return tracks 
 
-def do(): return deepsort(frames, results)
-tracks : list[list[Track]] = cache_opreation(do, TEMP_RESULT_DIR / "ftrack.pyz")
+def do(): return deepsort(masked, yolo_results)
+tracks : list[list[Track]] = cache_opreation(do, TEMP_RESULT_DIR / "deep_track.pyz")
 
-labeled_tracks = label_tracks(frames[:-1],Slicerator(tracks),srange(len(tracks)), names = names)
-# pim_export(labeled_tracks,TEMP_RESULT_DIR/ "track0.mp4",rate=30)
-# animate_images(labeled_tracks[S:L])
+labeled_tracks = label_tracks(masked,Slicerator(tracks),srange(len(tracks)),orig=True)
+# pim_export(labeled_tracks,TEMP_RESULT_DIR/ "deep_track0.mp4",rate=30)
+S = 1900
+animate_images(labeled_tracks[S:S+100])
 
-# %% Clean Up
+# %% Deep Sort Clean Up
 def dist(p1,p2): return np.linalg.norm(p1-p2)
 c = sum(tap_spots) / len(tap_spots)
 max_dist = int(mean([dist(c,t) for t in tap_spots]) + 10)
@@ -248,6 +273,25 @@ tracks_filtered = tracks.copy()
 tracks_by_id : dict[str, list[Track]] = {}
 for t in chain(*tracks_filtered): tracks_by_id[t.track_id] = tracks_by_id.get(t.track_id,[]) + [t]
 
+# split detections
+_next_id = max(tracks_by_id.keys())
+def next_id():
+    global _next_id
+    _next_id += 1
+    return _next_id
+
+def break_up_tracks(ts:list[Track], cs:list[int]):
+    starts = sorted([next(f for f,t in enumerate(ts) if t.det_class == c) for c in cs])[1:] + [len(ts)]
+    for t0,t1 in zip(starts[:-1], starts[1:]):
+        _next = next_id()
+        for t in ts[t0:t1]: t.track_id = _next
+
+tracks_by_id : dict[str, list[Track]] = {}
+distinct_ids = {k: v for k, ts in tracks_by_id.items() if len(v:=set(t.det_class for t in ts)) > 1}
+
+for t in chain(*tracks_filtered): tracks_by_id[t.track_id] = tracks_by_id.get(t.track_id,[]) + [t]
+for k,v in distinct_ids.items(): break_up_tracks(tracks_by_id[k],v)
+
 start_on_mids = [k for k,v in tracks_by_id.items() if not start_on_mid(v)]
 ends_on_edges = [k for k,v in tracks_by_id.items() if not ends_on_edge(v)]
 static_stars  = [k for k,v in tracks_by_id.items() if static_star(v)]
@@ -258,39 +302,21 @@ tracks_filtered = ([t for t in ts if within_circle(t)] for ts in tracks_filtered
 tracks_filtered = ([t for t in ts if t.track_id not in exclude_ids] for ts in tracks_filtered)
 tracks_filtered = list(tracks_filtered)
 
-labeled_tracks = label_tracks(frames[:-1],Slicerator(tracks_filtered),srange(len(tracks_filtered)), names=names)
+labeled_tracks = label_tracks(frames[:-1],Slicerator(tracks_filtered),srange(len(tracks_filtered)))
 tracks_by_id : dict[str, list[Track]] = {}
 for t in chain(*tracks_filtered): tracks_by_id[t.track_id] = tracks_by_id.get(t.track_id,[]) + [t]
 
 # animate_images(labeled_tracks[S:S+100])
-# % split detections
-_next_id = max(tracks_by_id.keys())
-def next_id():
-    global _next_id
-    _next_id += 1
-    return _next_id
-
-distinct_ids = {k: v for k, ts in tracks_by_id.items() if len(v:=set(t.det_class for t in ts)) > 1}
-def break_up_tracks(ts:list[Track], cs:list[int]):
-    starts = sorted([next(f for f,t in enumerate(ts) if t.det_class == c) for c in cs])[1:] + [len(ts)]
-    for t0,t1 in zip(starts[:-1], starts[1:]):
-        _next = next_id()
-        for t in ts[t0:t1]: t.track_id = _next
-
-for k,v in distinct_ids.items(): break_up_tracks(tracks_by_id[k],v)
-
-tracks_by_id : dict[str, list[Track]] = {}
-for t in chain(*tracks_filtered): tracks_by_id[t.track_id] = tracks_by_id.get(t.track_id,[]) + [t]
 
 too_short = [k for k,v in tracks_by_id.items() if len(v) < 15 and v[0].det_class != 3]
 tracks_filtered = ([t for t in ts if t.track_id not in too_short] for ts in tracks_filtered)
 tracks_filtered = [t if i > 310 else [] for i, t in enumerate(tracks_filtered)]
 
-# %% 
-S = 1100
-labeled_tracks = label_tracks(frames[:-1],Slicerator(tracks_filtered),srange(len(tracks_filtered)), names=names, orig=True)
-animate_images(labeled_tracks[S:S+100])
-# pim_export(labeled_tracks,TEMP_RESULT_DIR/ "track1.mp4",rate=30)
+# %
+S = 1500
+labeled_tracks = label_tracks(frames[:-1],Slicerator(tracks_filtered),srange(len(tracks_filtered)), orig=True)
+# animate_images(labeled_tracks[S:S+100])
+pim_export(labeled_tracks,TEMP_RESULT_DIR/ "deep_track1.mp4",rate=30)
 
 # %% create datasets
 def track_2_coco(t:Track, ih, iw):
@@ -320,7 +346,5 @@ with tqdm(total = len(dataset)) as pb:
     Parallel(-1, require="sharedmem")(delayed(do)(d, pb) for d in dataset)
 
 MediaPlayer('notif.mp3').play()
-pass
-# %% create obb and mask datasets
-S = 5850
-animate_images(tresh_mask_rgb(frames[:-1],128,method = cv2.THRESH_TOZERO)[S:S+100])
+
+#%%
